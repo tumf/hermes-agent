@@ -1360,8 +1360,11 @@ class GatewayRunner:
                     running_agent.interrupt("Session reset requested")
                 # Clear any pending messages so the old text doesn't replay
                 adapter = self.adapters.get(source.platform)
-                if adapter and hasattr(adapter, 'get_pending_message'):
-                    adapter.get_pending_message(_quick_key)  # consume and discard
+                if adapter and hasattr(adapter, 'clear_pending_messages'):
+                    adapter.clear_pending_messages(_quick_key)
+                elif adapter and hasattr(adapter, 'get_pending_message'):
+                    while adapter.get_pending_message(_quick_key):
+                        pass
                 self._pending_messages.pop(_quick_key, None)
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
@@ -1383,7 +1386,10 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    if hasattr(adapter, 'queue_pending_message'):
+                        adapter.queue_pending_message(_quick_key, queued_event)
+                    else:
+                        adapter._pending_messages[_quick_key] = queued_event
                 return "Queued for the next turn."
 
             if event.message_type == MessageType.PHOTO:
@@ -1391,8 +1397,8 @@ class GatewayRunner:
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     # Reuse adapter queue semantics so photo bursts merge cleanly.
-                    if _quick_key in adapter._pending_messages:
-                        existing = adapter._pending_messages[_quick_key]
+                    existing = adapter._peek_last_pending_message(_quick_key) if hasattr(adapter, '_peek_last_pending_message') else adapter._pending_messages.get(_quick_key)
+                    if existing:
                         if getattr(existing, "message_type", None) == MessageType.PHOTO:
                             existing.media_urls.extend(event.media_urls)
                             existing.media_types.extend(event.media_types)
@@ -1402,9 +1408,15 @@ class GatewayRunner:
                                 elif event.text not in existing.text:
                                     existing.text = f"{existing.text}\n\n{event.text}".strip()
                         else:
-                            adapter._pending_messages[_quick_key] = event
+                            if hasattr(adapter, 'queue_pending_message'):
+                                adapter.queue_pending_message(_quick_key, event)
+                            else:
+                                adapter._pending_messages[_quick_key] = event
                     else:
-                        adapter._pending_messages[_quick_key] = event
+                        if hasattr(adapter, 'queue_pending_message'):
+                            adapter.queue_pending_message(_quick_key, event)
+                        else:
+                            adapter._pending_messages[_quick_key] = event
                 return None
 
             running_agent = self._running_agents.get(_quick_key)
@@ -1417,7 +1429,10 @@ class GatewayRunner:
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
-                    adapter._pending_messages[_quick_key] = event
+                    if hasattr(adapter, 'queue_pending_message'):
+                        adapter.queue_pending_message(_quick_key, event)
+                    else:
+                        adapter._pending_messages[_quick_key] = event
                 return None
             logger.debug("PRIORITY interrupt for session %s", _quick_key[:20])
             running_agent.interrupt(event.text)

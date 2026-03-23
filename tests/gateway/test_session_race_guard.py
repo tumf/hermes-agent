@@ -9,6 +9,7 @@ duplicate agent.
 """
 
 import asyncio
+from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,19 @@ class _FakeAdapter:
 
     def __init__(self):
         self._pending_messages = {}
+
+    def queue_pending_message(self, session_key, event):
+        queue = self._pending_messages.setdefault(session_key, deque())
+        queue.append(event)
+
+    def get_pending_message(self, session_key):
+        queue = self._pending_messages.get(session_key)
+        if not queue:
+            return None
+        event = queue.popleft()
+        if not queue:
+            self._pending_messages.pop(session_key, None)
+        return event
 
     async def send(self, chat_id, text, **kwargs):
         pass
@@ -161,7 +175,7 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         assert session_key in adapter._pending_messages, (
             "Second message should be queued as pending"
         )
-        assert adapter._pending_messages[session_key] is event2
+        assert adapter.get_pending_message(session_key) is event2
 
         # Let first message complete
         barrier.set()

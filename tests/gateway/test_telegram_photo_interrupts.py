@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,6 +13,23 @@ from gateway.run import GatewayRunner
 class _PendingAdapter:
     def __init__(self):
         self._pending_messages = {}
+
+    def queue_pending_message(self, session_key, event):
+        queue = self._pending_messages.setdefault(session_key, deque())
+        queue.append(event)
+
+    def get_pending_message(self, session_key):
+        queue = self._pending_messages.get(session_key)
+        if not queue:
+            return None
+        event = queue.popleft()
+        if not queue:
+            self._pending_messages.pop(session_key, None)
+        return event
+
+    def _peek_last_pending_message(self, session_key):
+        queue = self._pending_messages.get(session_key)
+        return queue[-1] if queue else None
 
 
 def _make_runner():
@@ -46,4 +64,5 @@ async def test_handle_message_does_not_priority_interrupt_photo_followup():
 
     assert result is None
     running_agent.interrupt.assert_not_called()
-    assert runner.adapters[Platform.TELEGRAM]._pending_messages[session_key] is event
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter.get_pending_message(session_key) is event

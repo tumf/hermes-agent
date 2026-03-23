@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import uuid
+from collections import deque
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
@@ -356,7 +357,7 @@ class BasePlatformAdapter(ABC):
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
-        self._pending_messages: Dict[str, MessageEvent] = {}
+        self._pending_messages: Dict[str, deque[MessageEvent] | MessageEvent] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -835,7 +836,7 @@ class BasePlatformAdapter(ABC):
             # then process them immediately after the current task finishes.
             if event.message_type == MessageType.PHOTO:
                 print(f"[{self.name}] 🖼️ Queuing photo follow-up for session {session_key} without interrupt")
-                existing = self._pending_messages.get(session_key)
+                existing = self._peek_last_pending_message(session_key)
                 if existing and existing.message_type == MessageType.PHOTO:
                     existing.media_urls.extend(event.media_urls)
                     existing.media_types.extend(event.media_types)
@@ -845,12 +846,12 @@ class BasePlatformAdapter(ABC):
                         elif event.text not in existing.text:
                             existing.text = f"{existing.text}\n\n{event.text}".strip()
                 else:
-                    self._pending_messages[session_key] = event
+                    self.queue_pending_message(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             # Default behavior for non-photo follow-ups: interrupt the running agent
             print(f"[{self.name}] ⚡ New message while session {session_key} is active - triggering interrupt")
-            self._pending_messages[session_key] = event
+            self.queue_pending_message(session_key, event)
             # Signal the interrupt (the processing task checks this)
             self._active_sessions[session_key].set()
             return  # Don't process now - will be handled after current task finishes
@@ -1080,8 +1081,8 @@ class BasePlatformAdapter(ABC):
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
-                pending_event = self._pending_messages.pop(session_key)
+            pending_event = self.get_pending_message(session_key)
+            if pending_event:
                 print(f"[{self.name}] 📨 Processing queued message from interrupt")
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
@@ -1144,10 +1145,46 @@ class BasePlatformAdapter(ABC):
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
-    
+
+    def _ensure_pending_queue(self, session_key: str) -> deque[MessageEvent]:
+        existing = self._pending_messages.get(session_key)
+        if isinstance(existing, deque):
+            return existing
+        if existing is None:
+            queue: deque[MessageEvent] = deque()
+        else:
+            queue = deque([existing])
+        self._pending_messages[session_key] = queue
+        return queue
+
+    def _peek_last_pending_message(self, session_key: str) -> Optional[MessageEvent]:
+        existing = self._pending_messages.get(session_key)
+        if isinstance(existing, deque):
+            return existing[-1] if existing else None
+        return existing
+
+    def queue_pending_message(self, session_key: str, event: MessageEvent) -> None:
+        """Append a pending message for a session, preserving FIFO order."""
+        self._ensure_pending_queue(session_key).append(event)
+
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
-        """Get and clear any pending message for a session."""
+        """Get the next pending message for a session in FIFO order."""
+        existing = self._pending_messages.get(session_key)
+        if existing is None:
+            return None
+        if isinstance(existing, deque):
+            if not existing:
+                self._pending_messages.pop(session_key, None)
+                return None
+            event = existing.popleft()
+            if not existing:
+                self._pending_messages.pop(session_key, None)
+            return event
         return self._pending_messages.pop(session_key, None)
+
+    def clear_pending_messages(self, session_key: str) -> None:
+        """Discard all queued pending messages for a session."""
+        self._pending_messages.pop(session_key, None)
     
     def build_source(
         self,
